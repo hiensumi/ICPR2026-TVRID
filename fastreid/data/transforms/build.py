@@ -59,6 +59,15 @@ def build_transforms(cfg, is_train=True):
         do_rpt = cfg.INPUT.RPT.ENABLED
         rpt_prob = cfg.INPUT.RPT.PROB
 
+        # local grayscale patch replacement
+        do_lgpr = cfg.INPUT.LGPR.ENABLED
+        lgpr_prob = cfg.INPUT.LGPR.PROB
+        lgpr_patch_ratio = cfg.INPUT.LGPR.PATCH_RATIO
+
+        # global grayscale patch replacement
+        do_ggpr = cfg.INPUT.GGPR.ENABLED
+        ggpr_prob = cfg.INPUT.GGPR.PROB
+
         if do_autoaug:
             res.append(T.RandomApply([AutoAugment()], p=autoaug_prob))
 
@@ -74,12 +83,22 @@ def build_transforms(cfg, is_train=True):
                         T.RandomCrop(size_train[0] if len(size_train) == 1 else size_train)])
         if do_flip:
             res.append(T.RandomHorizontalFlip(p=flip_prob))
+            # Vertical flip: simulates DB `upsideDown` camera angle
+            do_vflip = getattr(cfg.INPUT.FLIP, "VERTICAL", False)
+            if do_vflip:
+                res.append(T.RandomVerticalFlip(p=0.3))
 
         if do_cj:
             res.append(T.RandomApply([T.ColorJitter(cj_brightness, cj_contrast, cj_saturation, cj_hue)], p=cj_prob))
+        if do_lgpr:
+            res.append(LGPR(prob=lgpr_prob, patch_ratio=lgpr_patch_ratio))
+        if do_ggpr:
+            res.append(GGPR(prob=ggpr_prob))
         if do_affine:
-            res.append(T.RandomAffine(degrees=10, translate=None, scale=[0.9, 1.1], shear=0.1, resample=False,
-                                      fillcolor=0))
+            affine_degrees = getattr(cfg.INPUT.AFFINE, "DEGREES", 45)
+            perspective_scale = getattr(cfg.INPUT.AFFINE, "PERSPECTIVE_SCALE", 0.6)
+            res.append(T.RandomPerspective(distortion_scale=perspective_scale, p=0.5))
+            res.append(T.RandomAffine(degrees=affine_degrees, translate=None, scale=[0.9, 1.1], shear=0.1))
         if do_augmix:
             res.append(AugMix(prob=augmix_prob))
         res.append(ToTensor())

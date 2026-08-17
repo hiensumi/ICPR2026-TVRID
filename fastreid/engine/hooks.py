@@ -333,12 +333,15 @@ class EvalHook(HookBase):
     It is executed every ``eval_period`` iterations and after the last iteration.
     """
 
-    def __init__(self, eval_period, eval_function):
+    def __init__(self, eval_period, eval_function, eval_loss_thresh=None, checkpointer=None, eval_start=0):
         """
         Args:
             eval_period (int): the period to run `eval_function`.
             eval_function (callable): a function which takes no arguments, and
                 returns a nested dict of evaluation metrics.
+            eval_loss_thresh (float, optional): If total_loss is greater than this, skip evaluation.
+            checkpointer (Checkpointer, optional): If provided, save a checkpoint after every successful evaluation.
+            eval_start (int, optional): The epoch from which to start evaluating.
         Note:
             This hook must be enabled in all or none workers.
             If you would like only certain workers to perform evaluation,
@@ -346,6 +349,10 @@ class EvalHook(HookBase):
         """
         self._period = eval_period
         self._func = eval_function
+        self._eval_loss_thresh = eval_loss_thresh
+        self._checkpointer = checkpointer
+        self._eval_start = eval_start
+        self._best_metric = -1  # Track best metric for model_best saving
 
     def _do_eval(self):
         results = self._func()
@@ -373,14 +380,48 @@ class EvalHook(HookBase):
 
     def after_epoch(self):
         next_epoch = self.trainer.epoch + 1
-        if self._period > 0 and next_epoch % self._period == 0:
+        
+        # Check if loss is below threshold
+        loss_ok = True
+        if self._eval_loss_thresh is not None:
+            storage = get_event_storage()
+            if "total_loss" in storage.histories():
+                curr_loss = storage.history("total_loss").median(20)
+                if curr_loss > self._eval_loss_thresh:
+                    loss_ok = False
+                    
+        if self._period > 0 and next_epoch >= self._eval_start and next_epoch % self._period == 0 and loss_ok:
             self._do_eval()
+            if self._checkpointer is not None and comm.is_main_process():
+                storage = get_event_storage()
+                latest = storage.latest()
+                metrics = [latest[d + "/metric"][0] for d in self.trainer.cfg.DATASETS.TESTS if d + "/metric" in latest]
+                if not metrics and "metric" in latest:
+                    metrics = [latest["metric"][0]]
+                metric = sum(metrics) / len(metrics) if metrics else -1
+                additional = {"epoch": self.trainer.epoch, "metric": metric}
+                if metric > self._best_metric:
+                    self._checkpointer.save("model_best", **additional)
+                    self._best_metric = metric
 
     def after_train(self):
         next_epoch = self.trainer.epoch + 1
         # This condition is to prevent the eval from running after a failed training
-        if next_epoch % self._period != 0 and next_epoch >= self.trainer.max_epoch:
+        # Also skip if _period is 0 (evaluation disabled)
+        if self._period > 0 and next_epoch % self._period != 0 and next_epoch >= self.trainer.max_epoch:
             self._do_eval()
+            if self._checkpointer is not None and comm.is_main_process():
+                storage = get_event_storage()
+                latest = storage.latest()
+                metrics = [latest[d + "/metric"][0] for d in self.trainer.cfg.DATASETS.TESTS if d + "/metric" in latest]
+                if not metrics and "metric" in latest:
+                    metrics = [latest["metric"][0]]
+                metric = sum(metrics) / len(metrics) if metrics else -1
+                additional = {"epoch": self.trainer.epoch, "metric": metric}
+                if metric > self._best_metric:
+                    self._checkpointer.save("model_best", **additional)
+                    self._best_metric = metric
+                self._checkpointer.save("model_final", **additional)
         # func is likely a closure that holds reference to the trainer
         # therefore we clean it to avoid circular reference in the end
         del self._func

@@ -16,3 +16,4 @@ from .mobilenet import build_mobilenetv2_backbone
 from .mobilenetv3 import build_mobilenetv3_backbone
 from .repvgg import build_repvgg_backbone
 from .vision_transformer import build_vit_backbone
+from .pcb_vit import build_vit_pcb_backbone

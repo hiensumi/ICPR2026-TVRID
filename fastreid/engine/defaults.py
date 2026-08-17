@@ -108,7 +108,11 @@ def default_setup(cfg, args):
         logger.info("Full config saved to {}".format(os.path.abspath(path)))
 
     # make sure each worker has a different, yet deterministic seed if specified
-    seed_all_rng()
+    seed = getattr(cfg, "SEED", -1)
+    seed = None if seed is None or seed < 0 else int(seed) + rank
+    if seed is not None:
+        logger.info("Using fixed random seed {}".format(seed))
+    seed_all_rng(seed)
 
     # cudnn benchmark has large overhead. It shouldn't be used considering the small size of
     # typical validation set.
@@ -209,6 +213,7 @@ class DefaultTrainer(TrainerBase):
             # for part of the parameters is not updated.
             model = DistributedDataParallel(
                 model, device_ids=[comm.get_local_rank()], broadcast_buffers=False,
+                find_unused_parameters=True,
             )
 
         self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
@@ -305,10 +310,17 @@ class DefaultTrainer(TrainerBase):
 
         # Do evaluation before checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
-        ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results))
+        
+        eval_loss_thresh = getattr(cfg.TEST, "EVAL_LOSS_THRESH", 0.0)
+        if eval_loss_thresh <= 0.0:
+            eval_loss_thresh = None
+            
+        eval_start = getattr(cfg.TEST, "EVAL_START", 0)
+        ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD, test_and_save_results, eval_loss_thresh, self.checkpointer, eval_start=eval_start))
 
         if comm.is_main_process():
-            ret.append(hooks.PeriodicCheckpointer(self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD))
+            checkpoint_start = getattr(cfg.SOLVER, "CHECKPOINT_START", 0)
+            ret.append(hooks.PeriodicCheckpointer(self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD, checkpoint_start=checkpoint_start))
             # run writers in the end, so that evaluation metrics are written
             ret.append(hooks.PeriodicWriter(self.build_writers(), 200))
 
@@ -347,10 +359,9 @@ class DefaultTrainer(TrainerBase):
         """
         super().train(self.start_epoch, self.max_epoch, self.iters_per_epoch)
         if comm.is_main_process():
-            assert hasattr(
-                self, "_last_eval_results"
-            ), "No evaluation results obtained during training!"
-            return self._last_eval_results
+            if hasattr(self, "_last_eval_results"):
+                return self._last_eval_results
+            return None  # No evaluation was performed
 
     def run_step(self):
         self._trainer.iter = self.iter
@@ -427,7 +438,7 @@ class DefaultTrainer(TrainerBase):
 
         results = OrderedDict()
         for idx, dataset_name in enumerate(cfg.DATASETS.TESTS):
-            logger.info("Prepare testing set")
+            # logger.info("Prepare testing set")
             try:
                 data_loader, evaluator = cls.build_evaluator(cfg, dataset_name)
             except NotImplementedError:
@@ -445,7 +456,7 @@ class DefaultTrainer(TrainerBase):
                 ), "Evaluator must return a dict on the main process. Got {} instead.".format(
                     results
                 )
-                logger.info("Evaluation results for {} in csv format:".format(dataset_name))
+                # logger.info("Evaluation results for {} in csv format:".format(dataset_name))
                 results_i['dataset'] = dataset_name
                 print_csv_format(results_i)
 

@@ -2,7 +2,8 @@
 import logging
 import pprint
 import sys
-from collections import Mapping, OrderedDict
+from collections import OrderedDict
+from collections.abc import Mapping
 
 import numpy as np
 from tabulate import tabulate
@@ -33,7 +34,7 @@ def print_csv_format(results):
         numalign="left",
     )
 
-    logger.info("Evaluation results in csv format: \n" + colored(table, "cyan"))
+    logger.info("Evaluation Results:\n" + table)
 
 
 def verify_results(cfg, results):

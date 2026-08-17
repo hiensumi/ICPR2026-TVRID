@@ -14,7 +14,10 @@ def log_accuracy(pred_class_logits, gt_classes, topk=(1,)):
     Log the accuracy metrics to EventStorage.
     """
     bsz = pred_class_logits.size(0)
-    maxk = max(topk)
+    num_classes = pred_class_logits.size(1)
+    maxk = min(max(topk), num_classes)  # Limit k to number of classes
+    if maxk == 0:
+        return  # Skip if no valid k
     _, pred_class = pred_class_logits.topk(maxk, 1, True, True)
     pred_class = pred_class.t()
     correct = pred_class.eq(gt_classes.view(1, -1).expand_as(pred_class))

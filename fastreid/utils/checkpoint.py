@@ -302,7 +302,7 @@ class PeriodicCheckpointer:
     multiple of period or if `max_iter` is reached.
     """
 
-    def __init__(self, checkpointer: Any, period: int, max_epoch: int = None):
+    def __init__(self, checkpointer: Any, period: int, max_epoch: int = None, checkpoint_start: int = 0):
         """
         Args:
             checkpointer (Any): the checkpointer object used to save
@@ -310,10 +310,12 @@ class PeriodicCheckpointer:
             period (int): the period to save checkpoint.
             max_epoch (int): maximum number of epochs. When it is reached,
                 a checkpoint named "model_final" will be saved.
+            checkpoint_start (int): only start saving checkpoints after this many epochs.
         """
         self.checkpointer = checkpointer
         self.period = int(period)
         self.max_epoch = max_epoch
+        self.checkpoint_start = int(checkpoint_start)
         self.best_metric = -1
 
     def step(self, epoch: int, **kwargs: Any):
@@ -328,21 +330,12 @@ class PeriodicCheckpointer:
         epoch = int(epoch)
         additional_state = {"epoch": epoch}
         additional_state.update(kwargs)
-        if (epoch + 1) % self.period == 0 and epoch < self.max_epoch - 1:
-            if additional_state["metric"] > self.best_metric:
-                self.checkpointer.save(
-                    "model_best", **additional_state
-                )
-                self.best_metric = additional_state["metric"]
+        if (epoch + 1) >= self.checkpoint_start and (epoch + 1) % self.period == 0 and epoch < self.max_epoch - 1:
             # Put it behind best model save to make last checkpoint valid
             self.checkpointer.save(
                 "model_{:04d}".format(epoch), **additional_state
             )
         if epoch >= self.max_epoch - 1:
-            if additional_state["metric"] > self.best_metric:
-                self.checkpointer.save(
-                    "model_best", **additional_state
-                )
             self.checkpointer.save("model_final", **additional_state)
 
     def save(self, name: str, **kwargs: Any):

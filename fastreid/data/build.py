@@ -6,6 +6,7 @@
 
 import logging
 import os
+from pathlib import Path
 
 import torch
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -16,12 +17,12 @@ if TORCH_MAJOR == 1 and TORCH_MINOR < 8:
 else:
     string_classes = str
 
-from collections import Mapping
+from collections.abc import Mapping
 
 from fastreid.config import configurable
 from fastreid.utils import comm
 from . import samplers
-from .common import CommDataset
+from .common import CommDataset, DepthMaskedCommDataset
 from .data_utils import DataLoaderX
 from .datasets import DATASET_REGISTRY
 from .transforms import build_transforms
@@ -31,7 +32,7 @@ __all__ = [
     "build_reid_test_loader"
 ]
 
-_root = os.getenv("FASTREID_DATASETS", "datasets")
+_root = str(Path(__file__).resolve().parent.parent.parent / "datasets")
 
 
 def _train_loader_from_config(cfg, *, train_set=None, transforms=None, sampler=None, **kwargs):
@@ -40,13 +41,44 @@ def _train_loader_from_config(cfg, *, train_set=None, transforms=None, sampler=N
 
     if train_set is None:
         train_items = list()
+        use_depth_mask = False
         for d in cfg.DATASETS.NAMES:
+            # Pass multi-frame config arguments so that dataset instances can capture them if needed
+            kwargs["n_frames"] = getattr(cfg.DATASETS, "N_FRAMES", 5)
+            kwargs["frame_strategy"] = getattr(cfg.DATASETS, "FRAME_STRATEGY", "middle_expand")
+            
             data = DATASET_REGISTRY.get(d)(root=_root, **kwargs)
             if comm.is_main_process():
                 data.show_train()
             train_items.extend(data.train)
+            if getattr(data, 'DEPTH_MASKED', False):
+                use_depth_mask = True
 
-        train_set = CommDataset(train_items, transforms, relabel=True)
+        # Build mask-based augmentation config from INPUT.BPE / INPUT.BGE
+        augment_cfg = {}
+        if cfg.INPUT.BPE.ENABLED:
+            augment_cfg['bpe'] = {
+                'prob': cfg.INPUT.BPE.PROB,
+                'erase_max': cfg.INPUT.BPE.ERASE_MAX,
+            }
+        if cfg.INPUT.BGE.ENABLED:
+            augment_cfg['bge'] = {
+                'prob': cfg.INPUT.BGE.PROB,
+            }
+        if cfg.INPUT.BGA.ENABLED:
+            augment_cfg['bga'] = {
+                'prob': cfg.INPUT.BGA.PROB,
+                'contrast_thresh': cfg.INPUT.BGA.CONTRAST_THRESH,
+                'mode': cfg.INPUT.BGA.MODE,
+                'specific_color': cfg.INPUT.BGA.SPECIFIC_COLOR,
+                'noise_std': cfg.INPUT.BGA.NOISE_STD,
+            }
+
+        if use_depth_mask:
+            DatasetClass = DepthMaskedCommDataset
+        else:
+            DatasetClass = CommDataset
+        train_set = DatasetClass(train_items, transforms, relabel=True, augment_cfg=augment_cfg)
 
     if sampler is None:
         sampler_name = cfg.DATALOADER.SAMPLER_TRAIN
@@ -93,14 +125,22 @@ def build_reid_train_loader(
 
     batch_sampler = torch.utils.data.sampler.BatchSampler(sampler, mini_batch_size, True)
 
-    train_loader = DataLoaderX(
-        comm.get_local_rank(),
-        dataset=train_set,
-        num_workers=num_workers,
-        batch_sampler=batch_sampler,
-        collate_fn=fast_batch_collator,
-        pin_memory=True,
-    )
+    if torch.cuda.is_available():
+        train_loader = DataLoaderX(
+            comm.get_local_rank(),
+            dataset=train_set,
+            num_workers=num_workers,
+            batch_sampler=batch_sampler,
+            collate_fn=fast_batch_collator,
+            pin_memory=True,
+        )
+    else:
+        train_loader = torch.utils.data.DataLoader(
+            dataset=train_set,
+            num_workers=num_workers,
+            batch_sampler=batch_sampler,
+            collate_fn=fast_batch_collator,
+        )
 
     return train_loader
 
@@ -111,11 +151,16 @@ def _test_loader_from_config(cfg, *, dataset_name=None, test_set=None, num_query
 
     if test_set is None:
         assert dataset_name is not None, "dataset_name must be explicitly passed in when test_set is not provided"
+        # Gather multi-frame config arguments identically to train
+        kwargs["n_frames"] = getattr(cfg.DATASETS, "N_FRAMES", 5)
+        kwargs["frame_strategy"] = getattr(cfg.DATASETS, "FRAME_STRATEGY", "middle_expand")
+        
         data = DATASET_REGISTRY.get(dataset_name)(root=_root, **kwargs)
         if comm.is_main_process():
             data.show_test()
         test_items = data.query + data.gallery
-        test_set = CommDataset(test_items, transforms, relabel=False)
+        DatasetClass = DepthMaskedCommDataset if getattr(data, 'DEPTH_MASKED', False) else CommDataset
+        test_set = DatasetClass(test_items, transforms, relabel=True)
 
         # Update query number
         num_query = len(data.query)
@@ -154,14 +199,22 @@ def build_reid_test_loader(test_set, test_batch_size, num_query, num_workers=4):
     mini_batch_size = test_batch_size // comm.get_world_size()
     data_sampler = samplers.InferenceSampler(len(test_set))
     batch_sampler = torch.utils.data.BatchSampler(data_sampler, mini_batch_size, False)
-    test_loader = DataLoaderX(
-        comm.get_local_rank(),
-        dataset=test_set,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,  # save some memory
-        collate_fn=fast_batch_collator,
-        pin_memory=True,
-    )
+    if torch.cuda.is_available():
+        test_loader = DataLoaderX(
+            comm.get_local_rank(),
+            dataset=test_set,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,  # save some memory
+            collate_fn=fast_batch_collator,
+            pin_memory=True,
+        )
+    else:
+        test_loader = torch.utils.data.DataLoader(
+            dataset=test_set,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=fast_batch_collator,
+        )
     return test_loader, num_query
 
 

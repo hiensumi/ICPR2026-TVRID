@@ -18,14 +18,14 @@ from ..datasets import DATASET_REGISTRY
 TRAIN_DIR_KEY = 'train_dir'
 TEST_DIR_KEY = 'test_dir'
 VERSION_DICT = {
+    'MSMT17_V2': {
+        TRAIN_DIR_KEY: 'mask_train_v2',
+        TEST_DIR_KEY: 'mask_test_v2',
+    },
     'MSMT17_V1': {
         TRAIN_DIR_KEY: 'train',
         TEST_DIR_KEY: 'test',
     },
-    'MSMT17_V2': {
-        TRAIN_DIR_KEY: 'mask_train_v2',
-        TEST_DIR_KEY: 'mask_test_v2',
-    }
 }
 
 
@@ -91,7 +91,11 @@ class MSMT17(ImageDataset):
 
         # Note: to fairly compare with published methods on the conventional ReID setting,
         #       do not add val images to the training set.
-        if 'combineall' in kwargs and kwargs['combineall']:
+        # Pop 'combineall' before calling super: MSMT17 handles it manually (val only).
+        # Leaving it in **kwargs would trigger base class combine_all() which adds
+        # query+gallery with "msmt17_test_X" camids → 30 unique cams → sie_embed OOB crash.
+        combineall = kwargs.pop('combineall', False)
+        if combineall:
             train += val
         super(MSMT17, self).__init__(train, query, gallery, **kwargs)
 
@@ -108,7 +112,9 @@ class MSMT17(ImageDataset):
             img_path = osp.join(dir_path, img_path)
             if is_train:
                 pid = self.dataset_name + "_" + str(pid)
-                camid = self.dataset_name + "_" + str(camid)
+            # Always string-wrap camid so train and test use the same cam_dict
+            # (alphabetical sort in CommDataset must be consistent between train/test)
+            camid = self.dataset_name + "_" + str(camid)
             data.append((img_path, pid, camid))
 
         return data

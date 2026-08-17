@@ -18,6 +18,7 @@ import torch
 from fastreid.config import CfgNode
 from fastreid.utils.params import ContiguousParams
 from . import lr_scheduler
+from . import optim
 
 _GradientClipperInput = Union[torch.Tensor, Iterable[torch.Tensor]]
 _GradientClipper = Callable[[_GradientClipperInput], None]
@@ -177,7 +178,7 @@ def maybe_add_freeze_layer(
         return OptimizerWithFreezeLayer
 
 
-def build_optimizer(cfg, model, contiguous=True):
+def build_optimizer(cfg, model, contiguous=False):
     params = get_default_optimizer_params(
         model,
         base_lr=cfg.SOLVER.BASE_LR,
@@ -185,6 +186,8 @@ def build_optimizer(cfg, model, contiguous=True):
         weight_decay_norm=cfg.SOLVER.WEIGHT_DECAY_NORM,
         bias_lr_factor=cfg.SOLVER.BIAS_LR_FACTOR,
         heads_lr_factor=cfg.SOLVER.HEADS_LR_FACTOR,
+        backbone_lr_factor=cfg.SOLVER.BACKBONE_LR_FACTOR,
+        layer_lr_decay=cfg.SOLVER.LAYER_LR_DECAY,
         weight_decay_bias=cfg.SOLVER.WEIGHT_DECAY_BIAS,
         freeze_layers=cfg.MODEL.FREEZE_LAYERS if cfg.SOLVER.FREEZE_ITERS > 0 else [],
     )
@@ -204,7 +207,7 @@ def build_optimizer(cfg, model, contiguous=True):
     else:
         return maybe_add_freeze_layer(
             cfg,
-            maybe_add_gradient_clipping(cfg, getattr(torch.optim, solver_opt))
+            maybe_add_gradient_clipping(cfg, getattr(optim, solver_opt))
         )(params.contiguous() if contiguous else params), params
 
 
@@ -215,6 +218,8 @@ def get_default_optimizer_params(
         weight_decay_norm: Optional[float] = None,
         bias_lr_factor: Optional[float] = 1.0,
         heads_lr_factor: Optional[float] = 1.0,
+        backbone_lr_factor: Optional[float] = 1.0,
+        layer_lr_decay: Optional[float] = 1.0,
         weight_decay_bias: Optional[float] = None,
         overrides: Optional[Dict[str, Dict[str, float]]] = None,
         freeze_layers: Optional[list] = [],
@@ -295,8 +300,33 @@ def get_default_optimizer_params(
             if isinstance(module, norm_module_types) and weight_decay_norm is not None:
                 hyperparams["weight_decay"] = weight_decay_norm
             hyperparams.update(overrides.get(module_param_name, {}))
+            
+            # Apply heads LR factor
             if module_name.split('.')[0] == "heads" and (heads_lr_factor is not None and heads_lr_factor != 1.0):
                 hyperparams["lr"] = hyperparams.get("lr", base_lr) * heads_lr_factor
+            # Apply backbone LR factor and layer-wise decay for ViT
+            elif module_name.startswith("backbone"):
+                current_lr = hyperparams.get("lr", base_lr)
+                # Apply backbone LR factor
+                if backbone_lr_factor is not None and backbone_lr_factor != 1.0:
+                    current_lr = current_lr * backbone_lr_factor
+                # Apply layer-wise decay for ViT blocks
+                if layer_lr_decay is not None and layer_lr_decay != 1.0:
+                    # Match ViT block patterns like backbone.blocks.0, backbone.blocks.11
+                    import re as re_mod
+                    block_match = re_mod.search(r'backbone\.blocks\.(\d+)', module_name)
+                    if block_match:
+                        block_idx = int(block_match.group(1))
+                        num_layers = 12  # ViT-Base has 12 blocks
+                        # Later layers get higher LR: lr * decay^(num_layers - 1 - block_idx)
+                        scale = layer_lr_decay ** (num_layers - 1 - block_idx)
+                        current_lr = current_lr * scale
+                    # Patch embed and pos_embed get lowest LR
+                    elif 'patch_embed' in module_name or 'pos_embed' in module_name or 'cls_token' in module_name:
+                        scale = layer_lr_decay ** 12  # Same as first block
+                        current_lr = current_lr * scale
+                hyperparams["lr"] = current_lr
+                
             name = module_name + '.' + module_param_name
             freeze_status = "normal"
             # Search freeze layer names, it must match from beginning, so use `match` not `search`
@@ -326,6 +356,13 @@ def build_lr_scheduler(cfg, optimizer, iters_per_epoch):
             "optimizer": optimizer,
             # cosine annealing lr scheduler options
             "T_max": max_epoch,
+            "eta_min": cfg.SOLVER.ETA_MIN_LR,
+        },
+        "CosineAnnealingWarmRestarts": {
+            "optimizer": optimizer,
+            # cosine annealing warm restarts options
+            "T_0": cfg.SOLVER.T_0,
+            "T_mult": cfg.SOLVER.T_MULT,
             "eta_min": cfg.SOLVER.ETA_MIN_LR,
         },
 

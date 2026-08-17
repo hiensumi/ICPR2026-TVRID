@@ -31,7 +31,7 @@ class CUHK03(ImageDataset):
     dataset_url = None
     dataset_name = "cuhk03"
 
-    def __init__(self, root='datasets', split_id=0, cuhk03_labeled=True, cuhk03_classic_split=False, **kwargs):
+    def __init__(self, root='datasets', split_id=0, cuhk03_labeled=False, cuhk03_classic_split=False, **kwargs):
         self.root = root
         self.dataset_dir = osp.join(self.root, self.dataset_dir)
 
@@ -92,8 +92,6 @@ class CUHK03(ImageDataset):
         # 3. create new split (Zhong et al. CVPR'17)
         if osp.exists(self.imgs_labeled_dir) \
                 and osp.exists(self.imgs_detected_dir) \
-                and osp.exists(self.split_classic_det_json_path) \
-                and osp.exists(self.split_classic_lab_json_path) \
                 and osp.exists(self.split_new_det_json_path) \
                 and osp.exists(self.split_new_lab_json_path):
             return

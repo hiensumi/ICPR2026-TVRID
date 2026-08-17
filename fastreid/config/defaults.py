@@ -15,6 +15,7 @@ from .config import CfgNode as CN
 # -----------------------------------------------------------------------------
 
 _C = CN()
+_C.SEED = -1
 
 # -----------------------------------------------------------------------------
 # MODEL
@@ -56,18 +57,25 @@ _C.MODEL.BACKBONE.ATT_DROP_RATE = 0.0
 _C.MODEL.BACKBONE.PRETRAIN = False
 # Pretrain model path
 _C.MODEL.BACKBONE.PRETRAIN_PATH = ''
+# Freeze backbone (no gradient update)
+_C.MODEL.BACKBONE.FREEZE = False
+# Return intermediate tokens for JPM (TransReID)
+_C.MODEL.BACKBONE.LOCAL_FEATURE = False
 
 # ---------------------------------------------------------------------------- #
 # REID HEADS options
 # ---------------------------------------------------------------------------- #
 _C.MODEL.HEADS = CN()
 _C.MODEL.HEADS.NAME = "EmbeddingHead"
+_C.MODEL.HEADS.NUM_PARTS = 4
 # Normalization method for the convolution layers.
 _C.MODEL.HEADS.NORM = "BN"
 # Number of identity
 _C.MODEL.HEADS.NUM_CLASSES = 0
 # Embedding dimension in head
 _C.MODEL.HEADS.EMBEDDING_DIM = 0
+# Use MLP projection instead of single linear layer
+_C.MODEL.HEADS.MLP_PROJECTION = False
 # If use BNneck in embedding
 _C.MODEL.HEADS.WITH_BNNECK = False
 # Triplet feature using feature before(after) bnneck
@@ -77,10 +85,18 @@ _C.MODEL.HEADS.POOL_LAYER = "GlobalAvgPool"
 
 # Classification layer type
 _C.MODEL.HEADS.CLS_LAYER = "Linear"  # ArcSoftmax" or "CircleSoftmax"
+# Per-branch cls layer for local branches in TransReIDBaseline; defaults to CLS_LAYER if empty
+_C.MODEL.HEADS.LOCAL_CLS_LAYER = ""
+
+# TransReID JPM options
+_C.MODEL.HEADS.SHUFFLE_GROUPS = 2
+_C.MODEL.HEADS.SHIFT_NUM = 5
+_C.MODEL.HEADS.DIVIDE_LENGTH = 4
+_C.MODEL.HEADS.RE_ARRANGE = True
 
 # Margin and Scale for margin-based classification layer
 _C.MODEL.HEADS.MARGIN = 0.
-_C.MODEL.HEADS.SCALE = 1
+_C.MODEL.HEADS.SCALE = 1.0
 
 # ---------------------------------------------------------------------------- #
 # REID LOSSES options
@@ -114,6 +130,20 @@ _C.MODEL.LOSSES.CIRCLE = CN()
 _C.MODEL.LOSSES.CIRCLE.MARGIN = 0.25
 _C.MODEL.LOSSES.CIRCLE.GAMMA = 128
 _C.MODEL.LOSSES.CIRCLE.SCALE = 1.0
+
+# XBM (Cross-Batch Memory) options
+_C.MODEL.LOSSES.XBM = CN()
+_C.MODEL.LOSSES.XBM.ENABLED = False
+_C.MODEL.LOSSES.XBM.SIZE = 8192
+_C.MODEL.LOSSES.XBM.START_EPOCH = 5
+_C.MODEL.LOSSES.XBM.SCALE = 1.0
+
+# CLM (Class-Level Feature Memory) options
+_C.MODEL.LOSSES.CLM = CN()
+_C.MODEL.LOSSES.CLM.ENABLED = False
+_C.MODEL.LOSSES.CLM.MOMENTUM = 0.999
+_C.MODEL.LOSSES.CLM.SCALE = 1.0
+_C.MODEL.LOSSES.CLM.MIN_CLASSES = 64
 
 # Cosface Loss options
 _C.MODEL.LOSSES.COSFACE = CN()
@@ -160,6 +190,7 @@ _C.INPUT.CROP.RATIO = [3./4., 4./3.]
 # Random probability for image horizontal flip
 _C.INPUT.FLIP = CN({"ENABLED": False})
 _C.INPUT.FLIP.PROB = 0.5
+_C.INPUT.FLIP.VERTICAL = False   # Vertical flip (simulate upside-down camera)
 
 # Value of padding size
 _C.INPUT.PADDING = CN({"ENABLED": False})
@@ -176,6 +207,8 @@ _C.INPUT.CJ.HUE = 0.1
 
 # Random Affine
 _C.INPUT.AFFINE = CN({"ENABLED": False})
+_C.INPUT.AFFINE.DEGREES = 45            # Max rotation angle (±degrees)
+_C.INPUT.AFFINE.PERSPECTIVE_SCALE = 0.6 # RandomPerspective distortion scale
 
 # Auto augmentation
 _C.INPUT.AUTOAUG = CN({"ENABLED": False})
@@ -193,6 +226,36 @@ _C.INPUT.REA.VALUE = [0.485*255, 0.456*255, 0.406*255]
 _C.INPUT.RPT = CN({"ENABLED": False})
 _C.INPUT.RPT.PROB = 0.5
 
+# Local Grayscale Patch Replacement
+_C.INPUT.LGPR = CN({"ENABLED": False})
+_C.INPUT.LGPR.PROB = 0.5
+_C.INPUT.LGPR.PATCH_RATIO = 0.3
+
+# Global Grayscale Patch Replacement  
+_C.INPUT.GGPR = CN({"ENABLED": False})
+_C.INPUT.GGPR.PROB = 0.2
+
+# Body Part Erasing — REA-style random erasing on person body, background intact
+_C.INPUT.BPE = CN({"ENABLED": False})
+_C.INPUT.BPE.PROB = 0.5
+_C.INPUT.BPE.ERASE_MAX = 3
+
+# Background Erasing — erases background pixels outside person mask
+_C.INPUT.BGE = CN({"ENABLED": False})
+_C.INPUT.BGE.PROB = 0.5
+
+# Background Alternating — replaces background with random contrasting color
+_C.INPUT.BGA = CN({"ENABLED": False})
+_C.INPUT.BGA.PROB = 0.5
+# Minimum Euclidean distance between person's dominant color and background color
+_C.INPUT.BGA.CONTRAST_THRESH = 80.0
+# Mode: 'random_color', 'specific_color', 'gaussian_noise'
+_C.INPUT.BGA.MODE = 'random_color'
+# Specific color to use (only if MODE is 'specific_color')
+_C.INPUT.BGA.SPECIFIC_COLOR = [0, 0, 0] # RGB
+# Standard deviation for Gaussian noise (only if MODE is 'gaussian_noise')
+_C.INPUT.BGA.NOISE_STD = 30.0
+
 # -----------------------------------------------------------------------------
 # Dataset
 # -----------------------------------------------------------------------------
@@ -203,6 +266,12 @@ _C.DATASETS.NAMES = ("Market1501",)
 _C.DATASETS.TESTS = ("Market1501",)
 # Combine trainset and testset joint training
 _C.DATASETS.COMBINEALL = False
+# Number of cameras in the dataset (0 = SIE disabled)
+_C.DATASETS.NUM_CAMERAS = 0
+
+# Multi-frame settings
+_C.DATASETS.N_FRAMES = 20
+_C.DATASETS.FRAME_STRATEGY = "middle_expand"
 
 # -----------------------------------------------------------------------------
 # DataLoader
@@ -236,6 +305,13 @@ _C.SOLVER.BASE_LR = 3e-4
 # you want to 10x higher than BASE_LR.
 _C.SOLVER.HEADS_LR_FACTOR = 1.
 
+# Backbone learning rate factor (lower for pretrained backbone)
+_C.SOLVER.BACKBONE_LR_FACTOR = 1.0
+
+# Layer-wise LR decay for ViT (exponential decay from last layer to first)
+# E.g., 0.75 means layer N gets lr * 0.75^(num_layers - N)
+_C.SOLVER.LAYER_LR_DECAY = 1.0
+
 _C.SOLVER.MOMENTUM = 0.9
 _C.SOLVER.NESTEROV = False
 
@@ -262,6 +338,10 @@ _C.SOLVER.STEPS = [30, 55]
 # Cosine annealing learning rate options
 _C.SOLVER.ETA_MIN_LR = 1e-7
 
+# Cosine annealing warm restarts options
+_C.SOLVER.T_0 = 50  # Number of epochs for first restart cycle
+_C.SOLVER.T_MULT = 2  # Multiplier for cycle length after each restart
+
 # Warmup options
 _C.SOLVER.WARMUP_FACTOR = 0.1
 _C.SOLVER.WARMUP_ITERS = 1000
@@ -271,6 +351,7 @@ _C.SOLVER.WARMUP_METHOD = "linear"
 _C.SOLVER.FREEZE_ITERS = 0
 
 _C.SOLVER.CHECKPOINT_PERIOD = 20
+_C.SOLVER.CHECKPOINT_START = 0
 
 # Number of images per batch across all machines.
 # This is global, so if we have 8 GPUs and IMS_PER_BATCH = 256, each GPU will
@@ -293,6 +374,10 @@ _C.SOLVER.CLIP_GRADIENTS.NORM_TYPE = 2.0
 _C.TEST = CN()
 
 _C.TEST.EVAL_PERIOD = 20
+# Stop evaluating before this epoch
+_C.TEST.EVAL_START = 0
+# If > 0.0, evaluation is only triggered when total_loss drops below this threshold
+_C.TEST.EVAL_LOSS_THRESH = 0.0
 
 # Number of images per batch across all machines.
 _C.TEST.IMS_PER_BATCH = 64

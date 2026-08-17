@@ -215,7 +215,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, embed_dim=768,
                  depth=12, num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., camera=0, drop_path_rate=0., hybrid_backbone=None,
-                 norm_layer=partial(nn.LayerNorm, eps=1e-6), sie_xishu=1.0, local_feature=False):
+                 norm_layer=partial(nn.LayerNorm, eps=1e-6), sie_xishu=1.0):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         if hybrid_backbone is not None:
@@ -232,7 +232,6 @@ class VisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.cam_num = camera
         self.sie_xishu = sie_xishu
-        self.local_feature = local_feature
         # Initialize SIE Embedding
         if camera > 1:
             self.sie_embed = nn.Parameter(torch.zeros(camera, 1, embed_dim))
@@ -281,17 +280,26 @@ class VisionTransformer(nn.Module):
 
         x = self.pos_drop(x)
 
-        if self.local_feature:
-            for blk in self.blocks[:-1]:
-                x = blk(x)
-            return x  # [B, N+1, D], no final block, no norm
-
         for blk in self.blocks:
             x = blk(x)
 
         x = self.norm(x)
 
-        return x[:, 0].reshape(x.shape[0], -1, 1, 1)
+        # For PCB: return the spatial tokens reshaped to 2D feature map
+        spatial_tokens = x[:, 1:]  # (B, N, C)
+        spatial_tokens = spatial_tokens.transpose(1, 2)  # (B, C, N)
+        
+        # num_y and num_x are defined in PatchEmbed
+        if hasattr(self.patch_embed, 'num_y'):
+            H = self.patch_embed.num_y
+            W = self.patch_embed.num_x
+        else:
+            # Fallback if not using overlapping patches
+            H = int(math.sqrt(spatial_tokens.shape[2]))
+            W = H
+            
+        spatial_tokens = spatial_tokens.view(B, -1, H, W)
+        return spatial_tokens
 
 
 def resize_pos_embed(posemb, posemb_new, hight, width):
@@ -315,7 +323,7 @@ def resize_pos_embed(posemb, posemb_new, hight, width):
 
 
 @BACKBONE_REGISTRY.register()
-def build_vit_backbone(cfg):
+def build_vit_pcb_backbone(cfg):
     """
     Create a Vision Transformer instance from config.
     Returns:
@@ -358,13 +366,9 @@ def build_vit_backbone(cfg):
         'base': None,
     }[depth]
 
-    num_cameras = cfg.DATASETS.NUM_CAMERAS
-    local_feature = cfg.MODEL.BACKBONE.LOCAL_FEATURE
-
     model = VisionTransformer(img_size=input_size, sie_xishu=sie_xishu, stride_size=stride_size, depth=num_depth,
                               num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                              drop_path_rate=drop_path_ratio, drop_rate=drop_ratio, attn_drop_rate=attn_drop_rate,
-                              camera=num_cameras, local_feature=local_feature)
+                              drop_path_rate=drop_path_ratio, drop_rate=drop_ratio, attn_drop_rate=attn_drop_rate)
 
     if pretrain:
         try:

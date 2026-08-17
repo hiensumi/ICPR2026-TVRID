@@ -94,7 +94,11 @@ def setup_logger(
 # with the same file name can safely write to the same file.
 @functools.lru_cache(maxsize=None)
 def _cached_log_stream(filename):
-    return PathManager.open(filename, "a")
+    io = PathManager.open(filename, "a")
+    import io as _io
+    if isinstance(io, _io.TextIOWrapper):
+        io.reconfigure(line_buffering=True)
+    return io
 
 
 """

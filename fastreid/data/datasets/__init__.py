@@ -40,4 +40,17 @@ from .veri import VeRi
 from .vehicleid import VehicleID, SmallVehicleID, MediumVehicleID, LargeVehicleID
 from .veriwild import VeRiWild, SmallVeRiWild, MediumVeRiWild, LargeVeRiWild
 
+# TVRID dataset for ICPR 2026 competition
+from .tvrid import (
+    TVRID_RGB, TVRID_Depth, TVRID_Cross,
+    TVRID_Depth_CombinedSplit, TVRID_Depth_CombinedSplit_DBStratified,
+    TVRID_Depth_CombinedSplit_DBHalf,
+    TVRID_RGB_CombinedSplit, TVRID_RGB_CombinedSplit_DBStratified,
+    TVRID_RGB_DBOnlySplit, TVRID_RGB_CombinedSplit_DBHalf,
+    TVRID_RGB_DBOnlySplit_MultiFrame,
+    TVRID_RGB_DBPublic_MultiFrame,
+    TVRID_RGB_TVPR2OnlySplit_MultiFrame,
+    TVRID_RGB_DB_AllVal, TVRID_RGB_CrossCameraVal,
+)
+
 __all__ = [k for k in globals().keys() if "builtin" not in k and not k.startswith("_")]

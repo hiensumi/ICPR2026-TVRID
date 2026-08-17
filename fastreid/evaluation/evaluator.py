@@ -99,7 +99,7 @@ def inference_on_dataset(model, data_loader, evaluator, flip_test=False):
     """
     num_devices = comm.get_world_size()
     logger = logging.getLogger(__name__)
-    logger.info("Start inference on {} images".format(len(data_loader.dataset)))
+    # logger.info("Start inference on {} images".format(len(data_loader.dataset)))
 
     total = len(data_loader)  # inference data loader must have a fixed length
     evaluator.reset()
@@ -107,7 +107,8 @@ def inference_on_dataset(model, data_loader, evaluator, flip_test=False):
     num_warmup = min(5, total - 1)
     start_time = time.perf_counter()
     total_compute_time = 0
-    with inference_context(model), torch.no_grad():
+    from torch.cuda.amp import autocast
+    with inference_context(model), torch.no_grad(), autocast():
         for idx, inputs in enumerate(data_loader):
             if idx == num_warmup:
                 start_time = time.perf_counter()
@@ -141,7 +142,6 @@ def inference_on_dataset(model, data_loader, evaluator, flip_test=False):
     # Measure the time only for this worker (before the synchronization barrier)
     total_time = time.perf_counter() - start_time
     total_time_str = str(datetime.timedelta(seconds=total_time))
-    # NOTE this format is parsed by grep
     logger.info(
         "Total inference time: {} ({:.6f} s / batch per device, on {} devices)".format(
             total_time_str, total_time / (total - num_warmup), num_devices

@@ -4,7 +4,7 @@
 @contact: sherlockliao01@gmail.com
 """
 
-__all__ = ['ToTensor', 'RandomPatch', 'AugMix', ]
+__all__ = ['ToTensor', 'RandomPatch', 'AugMix', 'LGPR', 'GGPR']
 
 import math
 import random
@@ -159,3 +159,103 @@ class AugMix(object):
 
         mixed = (1 - m) * image + m * mix
         return mixed.astype(np.uint8)
+
+
+class LGPR(object):
+    """
+    Local Grayscale Patch Replacement (LGPR)
+    Replaces a random rectangular patch with its grayscale version.
+    Forces model to learn structural features, not just color.
+    
+    Reference: Custom augmentation for person re-identification.
+    """
+
+    def __init__(self, prob=0.5, patch_ratio=0.3):
+        """
+        Args:
+            prob: Probability of applying this augmentation
+            patch_ratio: Base ratio of patch size relative to image size
+        """
+        self.prob = prob
+        self.patch_ratio = patch_ratio
+
+    def __call__(self, image):
+        """
+        Args:
+            image: PIL Image or numpy.ndarray (H, W, C)
+        Returns:
+            Augmented image as numpy array
+        """
+        if random.random() > self.prob:
+            if isinstance(image, np.ndarray):
+                return image
+            return np.asarray(image).copy()
+        
+        # Convert to numpy if PIL
+        if not isinstance(image, np.ndarray):
+            image = np.asarray(image).copy()
+        else:
+            image = image.copy()
+        
+        h, w = image.shape[:2]
+        
+        # Convert to grayscale
+        gray = np.dot(image[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+        gray_rgb = np.stack([gray, gray, gray], axis=-1)
+        
+        # Random patch size (variable around patch_ratio)
+        ph = int(h * random.uniform(self.patch_ratio * 0.8, self.patch_ratio * 1.5))
+        pw = int(w * random.uniform(self.patch_ratio * 0.8, self.patch_ratio * 1.5))
+        ph = min(ph, h - 1)
+        pw = min(pw, w - 1)
+        
+        # Random position
+        x = random.randint(0, max(1, w - pw))
+        y = random.randint(0, max(1, h - ph))
+        
+        # Replace patch with grayscale
+        image[y:y+ph, x:x+pw] = gray_rgb[y:y+ph, x:x+pw]
+        return image
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}(prob={self.prob}, patch_ratio={self.patch_ratio})'
+
+
+class GGPR(object):
+    """
+    Global Grayscale Patch Replacement (GGPR)
+    Converts entire image to grayscale with some probability.
+    Extreme regularization - model must learn shape/pose only.
+    
+    Reference: Custom augmentation for person re-identification.
+    """
+
+    def __init__(self, prob=0.2):
+        """
+        Args:
+            prob: Probability of applying this augmentation
+        """
+        self.prob = prob
+
+    def __call__(self, image):
+        """
+        Args:
+            image: PIL Image or numpy.ndarray (H, W, C)
+        Returns:
+            Augmented image as numpy array
+        """
+        if random.random() > self.prob:
+            if isinstance(image, np.ndarray):
+                return image
+            return np.asarray(image).copy()
+        
+        # Convert to numpy if PIL
+        if not isinstance(image, np.ndarray):
+            image = np.asarray(image)
+        
+        gray = np.dot(image[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+        gray_rgb = np.stack([gray, gray, gray], axis=-1)
+        return gray_rgb
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}(prob={self.prob})'

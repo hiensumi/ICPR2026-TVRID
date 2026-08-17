@@ -12,6 +12,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    from numba import njit, prange
+    _NUMBA = True
+except ImportError:
+    _NUMBA = False
+
 from .faiss_utils import (
     index_init_cpu,
     index_init_gpu,
@@ -49,9 +55,11 @@ def build_dist(feat_1: torch.Tensor, feat_2: torch.Tensor, metric: str = "euclid
         return compute_cosine_distance(feat_1, feat_2)
 
     elif metric == "jaccard":
+        Q = feat_1.size(0)
         feat = torch.cat((feat_1, feat_2), dim=0)
-        dist = compute_jaccard_distance(feat, k1=kwargs["k1"], k2=kwargs["k2"], search_option=0)
-        return dist[: feat_1.size(0), feat_1.size(0):]
+        dist = compute_jaccard_distance(feat, k1=kwargs["k1"], k2=kwargs["k2"],
+                                        search_option=2, query_num=Q)
+        return dist[:Q, Q:]
 
 
 def k_reciprocal_neigh(initial_rank, i, k1):
@@ -61,116 +69,339 @@ def k_reciprocal_neigh(initial_rank, i, k1):
     return forward_k_neigh_index[fi]
 
 
+def _build_reciprocal_sets(initial_rank, k1):
+    """Vectorised k-reciprocal neighbor computation. Returns list of arrays."""
+    N = initial_rank.shape[0]
+    half_k = int(np.around(k1 / 2))
+
+    k1p1 = k1 + 1
+    hkp1 = half_k + 1
+
+    fwd  = initial_rank[:, :k1p1]                              # [N, k1+1]
+    bwd  = initial_rank[fwd.ravel(), :k1p1].reshape(N, k1p1, k1p1)
+    i_idx = np.arange(N, dtype=np.int32)[:, None, None]
+    is_recip = (bwd == i_idx).any(axis=2)                      # [N, k1+1] bool
+    nn_k1 = [fwd[i][is_recip[i]] for i in range(N)]
+
+    half_fwd  = initial_rank[:, :hkp1]                        # [N, half_k+1]
+    half_bwd  = initial_rank[half_fwd.ravel(), :hkp1].reshape(N, hkp1, hkp1)
+    half_is_recip = (half_bwd == i_idx[:, :, :hkp1]).any(axis=2)
+    nn_k1_half = [half_fwd[i][half_is_recip[i]] for i in range(N)]
+
+    return nn_k1, nn_k1_half
+
+
+if _NUMBA:
+    @njit(parallel=True, cache=True)
+    def _build_V_nb(N, features_np, sq_norms,
+                    nn_k1_pad, nn_k1_sizes,
+                    nn_half_pad, nn_half_sizes,
+                    max_exp):
+        """Numba-parallel V-matrix construction (replaces Python loop in compute_jaccard_distance).
+
+        Returns padded (N, max_exp) arrays; valid entries at positions 0..out_sizes[i]-1.
+        Padding sentinel: out_cols[i, j] == -1.
+        """
+        D = features_np.shape[1]
+        out_cols  = np.full((N, max_exp), np.int32(-1),   dtype=np.int32)
+        out_vals  = np.zeros((N, max_exp),                dtype=np.float32)
+        out_sizes = np.zeros(N,                           dtype=np.int32)
+
+        for i in prange(N):
+            k_sz    = nn_k1_sizes[i]
+            k_recip = nn_k1_pad[i, :k_sz]
+
+            # ── expand k_recip with qualifying half-k neighbours ─────────────
+            exp_buf = np.full(max_exp, np.int32(-1), dtype=np.int32)
+            exp_sz  = 0
+            for idx in range(k_sz):
+                if exp_sz < max_exp:
+                    exp_buf[exp_sz] = k_recip[idx]
+                    exp_sz += 1
+
+            for ci in range(k_sz):
+                cand         = k_recip[ci]
+                cand_half_sz = nn_half_sizes[cand]
+
+                overlap = 0
+                for hi in range(cand_half_sz):
+                    h = nn_half_pad[cand, hi]
+                    for ki in range(k_sz):
+                        if k_recip[ki] == h:
+                            overlap += 1
+                            break
+
+                if overlap * 3 > cand_half_sz * 2:          # overlap > 2/3 * len
+                    for hi in range(cand_half_sz):
+                        h = nn_half_pad[cand, hi]
+                        found = False
+                        for ei in range(exp_sz):
+                            if exp_buf[ei] == h:
+                                found = True
+                                break
+                        if (not found) and exp_sz < max_exp:
+                            exp_buf[exp_sz] = h
+                            exp_sz += 1
+
+            # Sort exp_buf[:exp_sz] (insertion sort; exp_sz ≤ 300)
+            for a in range(1, exp_sz):
+                key = exp_buf[a]
+                b   = a - 1
+                while b >= 0 and exp_buf[b] > key:
+                    exp_buf[b + 1] = exp_buf[b]
+                    b -= 1
+                exp_buf[b + 1] = key
+
+            # ── L2² distances + numerically-stable softmax ───────────────────
+            sq_i    = sq_norms[i]
+            neg_max = np.float32(-1e38)
+            neg_d   = np.empty(exp_sz, dtype=np.float32)
+
+            for j in range(exp_sz):
+                idx_j = exp_buf[j]
+                dot   = np.float32(0.0)
+                for d in range(D):
+                    dot += features_np[i, d] * features_np[idx_j, d]
+                dist_sq = sq_i + sq_norms[idx_j] - np.float32(2.0) * dot
+                if dist_sq < np.float32(0.0):
+                    dist_sq = np.float32(0.0)
+                neg_d[j] = -dist_sq
+                if neg_d[j] > neg_max:
+                    neg_max = neg_d[j]
+
+            w_sum = np.float32(0.0)
+            for j in range(exp_sz):
+                neg_d[j] = np.exp(neg_d[j] - neg_max)
+                w_sum   += neg_d[j]
+
+            out_sizes[i] = exp_sz
+            for j in range(exp_sz):
+                out_cols[i, j] = exp_buf[j]
+                out_vals[i, j] = neg_d[j] / w_sum
+
+        return out_cols, out_vals, out_sizes
+
+    @njit(parallel=True, cache=True)
+    def _jaccard_dist_nb(Q, N_cols,
+                         r_indptr, r_indices, r_data,
+                         c_indptr, c_indices, c_data):
+        """Numba-parallel Jaccard distance (replaces Python loop in compute_jaccard_distance)."""
+        dist = np.zeros((Q, N_cols), dtype=np.float32)
+        for i in prange(Q):
+            temp = np.zeros(N_cols, dtype=np.float32)
+            for p in range(r_indptr[i], r_indptr[i + 1]):
+                k    = r_indices[p]
+                v_ik = r_data[p]
+                for q in range(c_indptr[k], c_indptr[k + 1]):
+                    j    = c_indices[q]
+                    v_jk = c_data[q]
+                    mn   = v_ik if v_ik < v_jk else v_jk
+                    temp[j] += mn
+            for j in range(N_cols):
+                denom = np.float32(2.0) - temp[j]
+                if denom < np.float32(1e-12):
+                    denom = np.float32(1e-12)
+                dist[i, j] = np.float32(1.0) - temp[j] / denom
+        return dist
+
+
 @torch.no_grad()
-def compute_jaccard_distance(features, k1=20, k2=6, search_option=0, fp16=False):
+def compute_jaccard_distance(features, k1=20, k2=6, search_option=0, fp16=False,
+                              query_num=None):
+    """Jaccard re-ranking (Zhong et al. CVPR 2017).
+
+    Uses a sparse V matrix (scipy CSR) — O(N·k) memory instead of O(N²).
+    When query_num is given, only the query×gallery block is returned (Q×G
+    instead of N×N), which is ~32× less work for MSMT17.
+    """
+    import scipy.sparse as sp
+
+    has_gpu_faiss = hasattr(faiss, "StandardGpuResources")
+    has_cuda      = torch.cuda.is_available()
+    run_on_gpu    = False
     if search_option < 3:
-        # torch.cuda.empty_cache()
-        features = features.cuda()
+        if has_gpu_faiss:
+            features = features.cuda()
+            run_on_gpu = True
+        else:
+            features = features.cpu()
 
-    ngpus = faiss.get_num_gpus()
     N = features.size(0)
-    mat_type = np.float16 if fp16 else np.float32
 
-    if search_option == 0:
-        # GPU + PyTorch CUDA Tensors (1)
+    if run_on_gpu and search_option == 0:
         res = faiss.StandardGpuResources()
         res.setDefaultNullStreamAllDevices()
-        _, initial_rank = search_raw_array_pytorch(res, features, features, k1)
+        _, initial_rank = search_raw_array_pytorch(res, features, features, k1 + 1)
         initial_rank = initial_rank.cpu().numpy()
-    elif search_option == 1:
-        # GPU + PyTorch CUDA Tensors (2)
+    elif run_on_gpu and search_option == 1:
         res = faiss.StandardGpuResources()
         index = faiss.GpuIndexFlatL2(res, features.size(-1))
         index.add(features.cpu().numpy())
-        _, initial_rank = search_index_pytorch(index, features, k1)
+        _, initial_rank = search_index_pytorch(index, features, k1 + 1)
         res.syncDefaultStreamCurrentDevice()
         initial_rank = initial_rank.cpu().numpy()
     elif search_option == 2:
-        # GPU
-        index = index_init_gpu(ngpus, features.size(-1))
-        index.add(features.cpu().numpy())
-        _, initial_rank = index.search(features.cpu().numpy(), k1)
+        # Exact k-NN via GPU PyTorch batched matmul — no faiss-gpu required.
+        # Uses L2² = ||a||²+||b||²-2 a·b, computed in chunks to stay within VRAM.
+        # At N=96k, D=768 on a single GPU: ~5-30 s vs 3.5 h for CPU FlatL2.
+        # Falls back to CPU IVFFlat when no CUDA is available (less accurate but faster
+        # than FlatL2 and still correct enough for re-ranking).
+        if has_cuda:
+            feat_t = features.cuda() if not features.is_cuda else features
+            sq = (feat_t ** 2).sum(dim=1)              # [N]
+            chunk = 512                                 # rows per GPU batch
+            all_idx = []
+            for s in range(0, N, chunk):
+                e = min(s + chunk, N)
+                # L2² = sq[s:e, None] + sq[None, :] - 2 * feat[s:e] @ feat.T
+                d = sq[s:e, None] + sq[None, :] - 2.0 * feat_t[s:e] @ feat_t.t()
+                d = d.clamp(min=0.0)
+                _, idx = torch.topk(d, k1 + 1, dim=1, largest=False, sorted=True)
+                all_idx.append(idx.cpu())
+            initial_rank = torch.cat(all_idx, dim=0).numpy()
+        else:
+            feat_np = features.cpu().numpy()
+            dim = feat_np.shape[1]
+            nlist = max(64, int(N ** 0.5))
+            nprobe = min(nlist, 128)
+            quantiser = faiss.IndexFlatL2(dim)
+            ivf = faiss.IndexIVFFlat(quantiser, dim, nlist, faiss.METRIC_L2)
+            ivf.train(feat_np)
+            ivf.add(feat_np)
+            ivf.nprobe = nprobe
+            _, initial_rank = ivf.search(feat_np, k1 + 1)
     else:
-        # CPU
         index = index_init_cpu(features.size(-1))
         index.add(features.cpu().numpy())
-        _, initial_rank = index.search(features.cpu().numpy(), k1)
+        _, initial_rank = index.search(features.cpu().numpy(), k1 + 1)
 
-    nn_k1 = []
-    nn_k1_half = []
-    for i in range(N):
-        nn_k1.append(k_reciprocal_neigh(initial_rank, i, k1))
-        nn_k1_half.append(k_reciprocal_neigh(initial_rank, i, int(np.around(k1 / 2))))
+    # ── k-reciprocal sets (vectorised, no per-sample GPU launches) ───────────
+    nn_k1, nn_k1_half = _build_reciprocal_sets(initial_rank, k1)
 
-    V = np.zeros((N, N), dtype=mat_type)
-    for i in range(N):
-        k_reciprocal_index = nn_k1[i]
-        k_reciprocal_expansion_index = k_reciprocal_index
-        for candidate in k_reciprocal_index:
-            candidate_k_reciprocal_index = nn_k1_half[candidate]
-            if len(
-                    np.intersect1d(candidate_k_reciprocal_index, k_reciprocal_index)
-            ) > 2 / 3 * len(candidate_k_reciprocal_index):
-                k_reciprocal_expansion_index = np.append(
-                    k_reciprocal_expansion_index, candidate_k_reciprocal_index
-                )
+    # ── Build sparse V on CPU (numpy, no GPU launch overhead per sample) ─────
+    features_np = features.cpu().numpy().astype(np.float32)
+    sq_norms = (features_np ** 2).sum(axis=1)          # [N] precomputed
 
-        k_reciprocal_expansion_index = np.unique(
-            k_reciprocal_expansion_index
-        )  # element-wise unique
+    if _NUMBA:
+        # Pad variable-length reciprocal sets into 2D arrays for numba
+        nn_k1_sizes  = np.array([len(a) for a in nn_k1],      dtype=np.int32)
+        nn_half_sizes = np.array([len(a) for a in nn_k1_half], dtype=np.int32)
+        max_k1  = int(nn_k1_sizes.max())  if N else 1
+        max_hk  = int(nn_half_sizes.max()) if N else 1
+        nn_k1_pad   = np.full((N, max_k1), -1, dtype=np.int32)
+        nn_half_pad = np.full((N, max_hk), -1, dtype=np.int32)
+        for i, a in enumerate(nn_k1):
+            nn_k1_pad[i, :len(a)] = a
+        for i, a in enumerate(nn_k1_half):
+            nn_half_pad[i, :len(a)] = a
 
-        x = features[i].unsqueeze(0).contiguous()
-        y = features[k_reciprocal_expansion_index]
-        m, n = x.size(0), y.size(0)
-        dist = (
-                torch.pow(x, 2).sum(dim=1, keepdim=True).expand(m, n)
-                + torch.pow(y, 2).sum(dim=1, keepdim=True).expand(n, m).t()
+        half_k  = int(np.around(k1 / 2))
+        max_exp = min(k1 + k1 * (half_k + 1) + 1, N)
+
+        out_cols_nb, out_vals_nb, out_sizes_nb = _build_V_nb(
+            N, features_np, sq_norms,
+            nn_k1_pad, nn_k1_sizes,
+            nn_half_pad, nn_half_sizes,
+            max_exp,
         )
-        dist.addmm_(x, y.t(), beta=1, alpha=-2)
+        del features_np, sq_norms, nn_k1_pad, nn_half_pad
 
-        if fp16:
-            V[i, k_reciprocal_expansion_index] = (
-                F.softmax(-dist, dim=1).view(-1).cpu().numpy().astype(mat_type)
-            )
-        else:
-            V[i, k_reciprocal_expansion_index] = (
-                F.softmax(-dist, dim=1).view(-1).cpu().numpy()
-            )
+        # Convert padded output to flat CSR arrays (vectorised — no Python loop)
+        valid_mask = out_cols_nb >= 0                            # (N, max_exp) bool
+        v_rows_flat = np.where(valid_mask)[0].astype(np.int32)
+        v_cols_flat = out_cols_nb[valid_mask]
+        v_vals_flat = out_vals_nb[valid_mask]
 
-    del nn_k1, nn_k1_half, x, y
-    features = features.cpu()
-
-    if k2 != 1:
-        V_qe = np.zeros_like(V, dtype=mat_type)
+        V = sp.csr_matrix(
+            (v_vals_flat, (v_rows_flat, v_cols_flat)),
+            shape=(N, N), dtype=np.float32
+        )
+    else:
+        v_rows, v_cols, v_vals = [], [], []
         for i in range(N):
-            V_qe[i, :] = np.mean(V[initial_rank[i, :k2], :], axis=0)
-        V = V_qe
-        del V_qe
+            k_recip = nn_k1[i]
+            expanded = k_recip
+            for cand in k_recip:
+                cand_half = nn_k1_half[cand]
+                overlap = len(np.intersect1d(cand_half, k_recip, assume_unique=False))
+                if overlap > 2 / 3 * len(cand_half):
+                    expanded = np.append(expanded, cand_half)
+            expanded = np.unique(expanded)
+
+            d = sq_norms[i] + sq_norms[expanded] - 2.0 * features_np[expanded].dot(features_np[i])
+            d = np.clip(d, 0.0, None)
+
+            neg_d = -d
+            neg_d -= neg_d.max()
+            w = np.exp(neg_d)
+            w /= w.sum()
+
+            v_rows.append(np.full(len(expanded), i, dtype=np.int32))
+            v_cols.append(expanded.astype(np.int32))
+            v_vals.append(w.astype(np.float32))
+
+        del features_np, sq_norms
+
+        V = sp.csr_matrix(
+            (np.concatenate(v_vals), (np.concatenate(v_rows), np.concatenate(v_cols))),
+            shape=(N, N), dtype=np.float32
+        )
+
+    # ── Query expansion via single sparse matmul ──────────────────────────────
+    if k2 != 1:
+        rows_w = np.repeat(np.arange(N, dtype=np.int32), k2)
+        cols_w = initial_rank[:, :k2].ravel().astype(np.int32)
+        W = sp.csr_matrix(
+            (np.full(N * k2, 1.0 / k2, dtype=np.float32), (rows_w, cols_w)),
+            shape=(N, N), dtype=np.float32
+        )
+        V = (W @ V).tocsr()
 
     del initial_rank
 
-    invIndex = []
-    for i in range(N):
-        invIndex.append(np.where(V[:, i] != 0)[0])  # len(invIndex)=all_num
+    # ── Jaccard — only compute query rows to avoid N×N output ────────────────
+    Q = query_num if query_num is not None else N
+    G = N - Q  # gallery size (or N when query_num not given)
 
-    jaccard_dist = np.zeros((N, N), dtype=mat_type)
-    for i in range(N):
-        temp_min = np.zeros((1, N), dtype=mat_type)
-        indNonZero = np.where(V[i, :] != 0)[0]
-        indImages = [invIndex[ind] for ind in indNonZero]
-        for j in range(len(indNonZero)):
-            temp_min[0, indImages[j]] = temp_min[0, indImages[j]] + np.minimum(
-                V[i, indNonZero[j]], V[indImages[j], indNonZero[j]]
-            )
+    V_csc = V.tocsc()
+    indptr  = V_csc.indptr
+    col_idx = V_csc.indices
+    col_val = V_csc.data
 
-        jaccard_dist[i] = 1 - temp_min / (2 - temp_min)
+    r_indptr  = V.indptr
+    r_indices = V.indices
+    r_data    = V.data
 
-    del invIndex, V
+    out_cols = N          # full width; caller slices [:Q, Q:]
 
-    pos_bool = jaccard_dist < 0
-    jaccard_dist[pos_bool] = 0.0
+    if _NUMBA:
+        jaccard_dist = _jaccard_dist_nb(
+            Q, out_cols,
+            r_indptr, r_indices, r_data,
+            indptr, col_idx, col_val,
+        )
+    else:
+        jaccard_dist = np.zeros((Q, out_cols), dtype=np.float32)
+        temp_min = np.zeros(out_cols, dtype=np.float32)
 
-    return jaccard_dist
+        for i in range(Q):
+            rs, re = r_indptr[i], r_indptr[i + 1]
+            nz_k = r_indices[rs:re]
+            nz_v = r_data[rs:re]
+
+            temp_min[:] = 0.0
+            for ki in range(len(nz_k)):
+                cs = indptr[nz_k[ki]]
+                ce = indptr[nz_k[ki] + 1]
+                j_idx = col_idx[cs:ce]
+                j_val = col_val[cs:ce]
+                temp_min[j_idx] += np.minimum(nz_v[ki], j_val)
+
+            denom = 2.0 - temp_min
+            denom[denom < 1e-12] = 1e-12
+            jaccard_dist[i] = 1.0 - temp_min / denom
+
+    return np.clip(jaccard_dist, 0.0, None)
 
 
 @torch.no_grad()
